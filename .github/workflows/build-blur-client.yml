@@ -1,6 +1,9 @@
 name: Build Telegram Blur Client
 
 on:
+  push:
+    paths:
+      - ".github/workflows/build-blur-client.yml"
   workflow_dispatch:
 
 jobs:
@@ -11,7 +14,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # تغییر پکیج برای نصب کنار تلگرام اصلی
+      # تغییر APP_PACKAGE برای نصب کنار تلگرام اصلی
       - name: Change APP_PACKAGE so it installs alongside official Telegram
         run: |
           if grep -q '^APP_PACKAGE=' gradle.properties; then
@@ -22,7 +25,16 @@ jobs:
           echo "Current APP_PACKAGE:"
           grep '^APP_PACKAGE=' gradle.properties || true
 
-      # اضافه کردن کلاس‌های تنظیمات و هلسپر بلر
+      # غیرفعال کردن Google Services (Firebase) برای جلوگیری از خطای package name
+      - name: Disable Google Services plugin (no Firebase for custom package)
+        run: |
+          FILE="TMessagesProj_App/build.gradle"
+          if [ -f "$FILE" ]; then
+            sed -i "s/apply plugin: 'com.google.gms.google-services'//g" "$FILE"
+            sed -i 's/apply plugin: \"com.google.gms.google-services\"//g' "$FILE"
+          fi
+
+      # اضافه کردن کلاس‌های تنظیمات و helper بلر
       - name: Add blur helper classes
         run: |
           mkdir -p TMessagesProj/src/main/java/org/telegram/ui/blur
@@ -74,7 +86,7 @@ jobs:
 
           public class RealBlurBubbleHelper {
 
-              // والپیپر (blur شده یا آماده‌ی blur)
+              // والپیپر (بلر شده یا آماده‌ی بلر)
               private static Bitmap wallpaperBitmap;
               private static Bitmap blurredWallpaperBitmap;
 
@@ -122,8 +134,11 @@ jobs:
                   if (scale == 1f) {
                       blurredWallpaperBitmap = wallpaperBitmap;
                   } else {
-                      blurredWallpaperBitmap = Bitmap.createScaledBitmap(wallpaperBitmap, scaledW, scaledH, true);
-                      blurredWallpaperBitmap = Bitmap.createScaledBitmap(blurredWallpaperBitmap, srcW, srcH, true);
+                      Bitmap tmp = Bitmap.createScaledBitmap(wallpaperBitmap, scaledW, scaledH, true);
+                      blurredWallpaperBitmap = Bitmap.createScaledBitmap(tmp, srcW, srcH, true);
+                      if (tmp != blurredWallpaperBitmap) {
+                          tmp.recycle();
+                      }
                   }
               }
 
@@ -384,12 +399,12 @@ jobs:
           }
           EOF
 
-      # پچ خود ChatMessageCell: اضافه کردن import و صدا زدن drawBlurBubble
+      # پچ ChatMessageCell: اضافه کردن import و صدا زدن drawBlurBubble
       - name: Patch ChatMessageCell imports and drawBackgroundInternal
         run: |
           CHAT_CELL="TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java"
 
-          # اضافه کردن importها
+          # اضافه کردن importها بعد از package
           sed -i '/package org.telegram.ui.Cells;/a\
           \
           import org.telegram.ui.blur.BlurBubbleConfig;\
@@ -415,10 +430,11 @@ jobs:
               }\
           ' "$CHAT_CELL"
 
-      # بیلد با Dockerfile رسمی تلگرام
+      # ساخت ایمیج Docker با Dockerfile رسمی تلگرام
       - name: Build Docker image
         run: docker build -t telegram-build .
 
+      # اجرای build داخل کانتینر
       - name: Build APKs via Docker
         run: docker run --rm -v "$PWD":/home/source telegram-build
 
