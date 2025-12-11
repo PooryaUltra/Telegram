@@ -55,7 +55,7 @@ jobs:
           echo "Current APP_PACKAGE:"
           grep '^APP_PACKAGE=' gradle.properties || true
 
-      # حذف Google Services (Firebase) تا از google-services.json و package ارور نگیریم
+      # حذف Google Services (Firebase)
       - name: Disable Google Services plugin
         run: |
           FILE="TMessagesProj_App/build.gradle"
@@ -64,7 +64,7 @@ jobs:
             sed -i 's/apply plugin: \"com.google.gms.google-services\"//g' "$FILE"
           fi
 
-      # پایین‌آوردن buildToolsVersion از 35.0.0 به 34.0.0 (پایدار)
+      # پایین‌آوردن buildToolsVersion از 35.0.0 به 34.0.0
       - name: Patch buildToolsVersion to 34.0.0
         run: |
           for FILE in TMessagesProj_App/build.gradle TMessagesProj/build.gradle; do
@@ -318,7 +318,7 @@ jobs:
           }
           EOF
 
-      # بازنویسی WallpaperBitmapProvider برای تأمین والپیپر بلر شده
+      # بازنویسی WallpaperBitmapProvider
       - name: Patch WallpaperBitmapProvider
         run: |
           mkdir -p TMessagesProj/src/main/java/org/telegram/ui/Components/chat
@@ -452,33 +452,19 @@ jobs:
           }
           EOF
 
-      # پچ ChatMessageCell: اضافه‌کردن import و رسم حباب بلر
+      # پچ ChatMessageCell: حباب بلر جایگزین حباب اصلی می‌شود
       - name: Patch ChatMessageCell
         run: |
           CHAT="TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java"
 
+          # importها
           sed -i '/package org.telegram.ui.Cells;/a\
           import org.telegram.ui.blur.BlurBubbleConfig;\
           import org.telegram.ui.blur.RealBlurBubbleHelper;\
           ' "$CHAT"
 
-          sed -i '/int restoreCount = canvas.getSaveCount();/a\
-              if (BlurBubbleConfig.enabled && getParent() instanceof android.view.View && currentBackgroundDrawable != null && currentMessageObject != null) {\
-                  boolean isOut = currentMessageObject.isOutOwner();\
-                  boolean shouldBlur = isOut ? BlurBubbleConfig.shouldBlurOutgoing() : BlurBubbleConfig.shouldBlurIncoming();\
-                  if (shouldBlur) {\
-                      android.graphics.Rect bounds = currentBackgroundDrawable.getBounds();\
-                      RealBlurBubbleHelper.drawBlurBubble(\
-                          canvas,\
-                          (android.view.View) getParent(),\
-                          bounds,\
-                          isOut,\
-                          isDrawSelectionBackground(),\
-                          resourcesProvider\
-                      );\
-                  }\
-              }\
-          ' "$CHAT"
+          # جایگزین‌کردن draw بک‌گراند اصلی با نسخه‌ی بلر (در صورت فعال بودن)
+          sed -i "s/currentBackgroundDrawable\.draw(canvas);/if (BlurBubbleConfig.enabled && getParent() instanceof android.view.View && currentMessageObject != null) {\n              android.graphics.Rect bounds = currentBackgroundDrawable.getBounds();\n              RealBlurBubbleHelper.drawBlurBubble(\n                      canvas,\n                      (android.view.View) getParent(),\n                      bounds,\n                      currentMessageObject.isOutOwner(),\n                      isDrawSelectionBackground(),\n                      resourcesProvider\n              );\n          } else {\n              currentBackgroundDrawable.draw(canvas);\n          }/g" "$CHAT"
 
       # بیلد فقط afatRelease (یونیورسال)
       - name: Build afatRelease APK (universal)
