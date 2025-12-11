@@ -1,4 +1,4 @@
-      - name: Super Cleanup to free disk
+name: Super Cleanup to free disk
         run: |
           echo "Before cleanup:"
           df -h
