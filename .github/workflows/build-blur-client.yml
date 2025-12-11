@@ -10,11 +10,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # تغییر APP_PACKAGE برای نصب کنار تلگرام اصلی
+      # --- تغییر APP_PACKAGE برای نصب کنار تلگرام اصلی ---
       - name: Change APP_PACKAGE so it installs alongside official Telegram
         run: |
           if grep -q '^APP_PACKAGE=' gradle.properties; then
@@ -25,8 +28,8 @@ jobs:
           echo "Current APP_PACKAGE:"
           grep '^APP_PACKAGE=' gradle.properties || true
 
-      # غیرفعال کردن Google Services (Firebase) برای جلوگیری از خطای package name
-      - name: Disable Google Services plugin (no Firebase for custom package)
+      # --- غیرفعال کردن Google Services (Firebase) تا ارور package name نده ---
+      - name: Disable Google Services plugin
         run: |
           FILE="TMessagesProj_App/build.gradle"
           if [ -f "$FILE" ]; then
@@ -34,7 +37,33 @@ jobs:
             sed -i 's/apply plugin: \"com.google.gms.google-services\"//g' "$FILE"
           fi
 
-      # اضافه کردن کلاس‌های تنظیمات و helper بلر
+      # --- پایین آوردن buildToolsVersion از ۳۵ به ۳۴.۰.۰ برای جلوگیری از ارور Build Tools ---
+      - name: Patch buildToolsVersion to 34.0.0
+        run: |
+          FILE="TMessagesProj_App/build.gradle"
+          if [ -f "$FILE" ]; then
+            sed -i "s/buildToolsVersion '35.0.0'/buildToolsVersion '34.0.0'/g" "$FILE"
+          fi
+
+      # --- نصب JDK و Android SDK ---
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;34.0.0" "ndk;21.4.7075529"
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # --- اضافه کردن کلاس‌های بلر ---
       - name: Add blur helper classes
         run: |
           mkdir -p TMessagesProj/src/main/java/org/telegram/ui/blur
@@ -51,10 +80,7 @@ jobs:
               public static boolean blurIncoming = true;
               public static boolean blurOutgoing = true;
 
-              // شدت بلر اضافه روی والپیپر (روی نسخه‌ی downscaled)
-              public static float blurRadius = 8f;
-
-              // نسبت downscale (هرچی کمتر، سبک‌تر)
+              // نسبت scale برای bitmap بلر‌شده (۰.۲ تا ۱)
               public static float bitmapScale = 0.5f;
 
               public static boolean shouldBlurIncoming() {
@@ -86,7 +112,6 @@ jobs:
 
           public class RealBlurBubbleHelper {
 
-              // والپیپر (بلر شده یا آماده‌ی بلر)
               private static Bitmap wallpaperBitmap;
               private static Bitmap blurredWallpaperBitmap;
 
@@ -123,18 +148,17 @@ jobs:
 
                   lastWallpaperHash = wallpaperBitmap.hashCode();
 
-                  // اینجا فرض می‌گیریم والپیپر از قبل توسط WallpaperBitmapProvider بلر شده
-                  // فقط در صورت نیاز کمی rescale می‌کنیم
-                  float scale = Math.max(0.2f, Math.min(1f, BlurBubbleConfig.bitmapScale));
+                  // این‌جا فرض می‌کنیم والپیپر از قبل در WallpaperBitmapProvider بلر شده
+                  // فقط scale نرم و سبک:
+                  float s = Math.max(0.2f, Math.min(1f, BlurBubbleConfig.bitmapScale));
                   int srcW = wallpaperBitmap.getWidth();
                   int srcH = wallpaperBitmap.getHeight();
-                  int scaledW = Math.max(1, Math.round(srcW * scale));
-                  int scaledH = Math.max(1, Math.round(srcH * scale));
-
-                  if (scale == 1f) {
+                  if (s == 1f) {
                       blurredWallpaperBitmap = wallpaperBitmap;
                   } else {
-                      Bitmap tmp = Bitmap.createScaledBitmap(wallpaperBitmap, scaledW, scaledH, true);
+                      int w = Math.max(1, Math.round(srcW * s));
+                      int h = Math.max(1, Math.round(srcH * s));
+                      Bitmap tmp = Bitmap.createScaledBitmap(wallpaperBitmap, w, h, true);
                       blurredWallpaperBitmap = Bitmap.createScaledBitmap(tmp, srcW, srcH, true);
                       if (tmp != blurredWallpaperBitmap) {
                           tmp.recycle();
@@ -267,9 +291,11 @@ jobs:
           }
           EOF
 
-      # بازنویسی WallpaperBitmapProvider تا والپیپر بلر را به RealBlurBubbleHelper بدهد
+      # --- بازنویسی WallpaperBitmapProvider تا والپیپر بلر را به helper بدهد ---
       - name: Patch WallpaperBitmapProvider
         run: |
+          mkdir -p TMessagesProj/src/main/java/org/telegram/ui/Components/chat
+
           cat > TMessagesProj/src/main/java/org/telegram/ui/Components/chat/WallpaperBitmapProvider.java << 'EOF'
           package org.telegram.ui.Components.chat;
 
@@ -399,19 +425,16 @@ jobs:
           }
           EOF
 
-      # پچ ChatMessageCell: اضافه کردن import و صدا زدن drawBlurBubble
-      - name: Patch ChatMessageCell imports and drawBackgroundInternal
+      # --- پچ ChatMessageCell برای اضافه کردن import و رسم حباب بلر ---
+      - name: Patch ChatMessageCell
         run: |
-          CHAT_CELL="TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java"
+          CHAT="TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java"
 
-          # اضافه کردن importها بعد از package
           sed -i '/package org.telegram.ui.Cells;/a\
-          \
           import org.telegram.ui.blur.BlurBubbleConfig;\
           import org.telegram.ui.blur.RealBlurBubbleHelper;\
-          ' "$CHAT_CELL"
+          ' "$CHAT"
 
-          # اضافه کردن فراخوانی drawBlurBubble بعد از restoreCount
           sed -i '/int restoreCount = canvas.getSaveCount();/a\
               if (BlurBubbleConfig.enabled && getParent() instanceof android.view.View && currentBackgroundDrawable != null && currentMessageObject != null) {\
                   boolean isOut = currentMessageObject.isOutOwner();\
@@ -419,30 +442,25 @@ jobs:
                   if (shouldBlur) {\
                       android.graphics.Rect bounds = currentBackgroundDrawable.getBounds();\
                       RealBlurBubbleHelper.drawBlurBubble(\
-                              canvas,\
-                              (android.view.View) getParent(),\
-                              bounds,\
-                              isOut,\
-                              isDrawSelectionBackground(),\
-                              resourcesProvider\
+                          canvas,\
+                          (android.view.View) getParent(),\
+                          bounds,\
+                          isOut,\
+                          isDrawSelectionBackground(),\
+                          resourcesProvider\
                       );\
                   }\
               }\
-          ' "$CHAT_CELL"
+          ' "$CHAT"
 
-      # ساخت ایمیج Docker با Dockerfile رسمی تلگرام
-      - name: Build Docker image
-        run: docker build -t telegram-build .
+      # --- بیلد تنها variant afatRelease (APK یونیورسال) ---
+      - name: Build afatRelease APK (universal)
+        run: ./gradlew :TMessagesProj_App:assembleAfatRelease --no-daemon --stacktrace
 
-      # اجرای build داخل کانتینر
-      - name: Build APKs via Docker
-        run: docker run --rm -v "$PWD":/home/source telegram-build
-
-      - name: Upload APK artifacts
+      # --- آپلود خروجی یونیورسال ---
+      - name: Upload universal APK
         uses: actions/upload-artifact@v4
         with:
-          name: telegram-blurclient-apks
-          path: |
-            TMessagesProj/build/outputs/apk/**/*.apk
-            TMessagesProj/build/outputs/bundle/**/*.aab
-          if-no-files-found: warn
+          name: apk-universal
+          path: "TMessagesProj/build/outputs/apk/afat/release/app.apk"
+          if-no-files-found: error
