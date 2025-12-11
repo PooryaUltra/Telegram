@@ -1,0 +1,432 @@
+name: Build Telegram Blur Client
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # تغییر پکیج برای نصب کنار تلگرام اصلی
+      - name: Change APP_PACKAGE so it installs alongside official Telegram
+        run: |
+          if grep -q '^APP_PACKAGE=' gradle.properties; then
+            sed -i 's/^APP_PACKAGE=.*/APP_PACKAGE=org.telegram.messenger.blurclient/' gradle.properties
+          else
+            echo 'APP_PACKAGE=org.telegram.messenger.blurclient' >> gradle.properties
+          fi
+          echo "Current APP_PACKAGE:"
+          grep '^APP_PACKAGE=' gradle.properties || true
+
+      # اضافه کردن کلاس‌های تنظیمات و هلسپر بلر
+      - name: Add blur helper classes
+        run: |
+          mkdir -p TMessagesProj/src/main/java/org/telegram/ui/blur
+
+          cat > TMessagesProj/src/main/java/org/telegram/ui/blur/BlurBubbleConfig.java << 'EOF'
+          package org.telegram.ui.blur;
+
+          public class BlurBubbleConfig {
+
+              // فعال / غیرفعال کردن کلی بلر
+              public static boolean enabled = true;
+
+              // فقط پیام‌های ورودی / خروجی
+              public static boolean blurIncoming = true;
+              public static boolean blurOutgoing = true;
+
+              // شدت بلر اضافه روی والپیپر (روی نسخه‌ی downscaled)
+              public static float blurRadius = 8f;
+
+              // نسبت downscale (هرچی کمتر، سبک‌تر)
+              public static float bitmapScale = 0.5f;
+
+              public static boolean shouldBlurIncoming() {
+                  return enabled && blurIncoming;
+              }
+
+              public static boolean shouldBlurOutgoing() {
+                  return enabled && blurOutgoing;
+              }
+          }
+          EOF
+
+          cat > TMessagesProj/src/main/java/org/telegram/ui/blur/RealBlurBubbleHelper.java << 'EOF'
+          package org.telegram.ui.blur;
+
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapShader;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Matrix;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.Rect;
+          import android.graphics.Shader;
+          import android.view.View;
+
+          import org.telegram.messenger.AndroidUtilities;
+          import org.telegram.ui.ActionBar.Theme;
+
+          public class RealBlurBubbleHelper {
+
+              // والپیپر (blur شده یا آماده‌ی blur)
+              private static Bitmap wallpaperBitmap;
+              private static Bitmap blurredWallpaperBitmap;
+
+              private static int lastWallpaperHash = 0;
+
+              private static final Paint blurPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private static final Paint tintPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private static final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private static final Path bubblePath = new Path();
+              private static final Matrix shaderMatrix = new Matrix();
+
+              static {
+                  blurPaint.setFilterBitmap(true);
+                  borderPaint.setStyle(Paint.Style.STROKE);
+                  borderPaint.setStrokeWidth(AndroidUtilities.dp(0.5f));
+              }
+
+              // از WallpaperBitmapProvider صدا زده می‌شود
+              public static void updateWallpaper(Bitmap wallpaper) {
+                  wallpaperBitmap = wallpaper;
+                  blurredWallpaperBitmap = null;
+                  lastWallpaperHash = wallpaperBitmap != null ? wallpaperBitmap.hashCode() : 0;
+              }
+
+              private static void ensureBlurredWallpaper() {
+                  if (wallpaperBitmap == null || wallpaperBitmap.isRecycled()) {
+                      blurredWallpaperBitmap = null;
+                      return;
+                  }
+                  if (blurredWallpaperBitmap != null &&
+                          wallpaperBitmap.hashCode() == lastWallpaperHash) {
+                      return;
+                  }
+
+                  lastWallpaperHash = wallpaperBitmap.hashCode();
+
+                  // اینجا فرض می‌گیریم والپیپر از قبل توسط WallpaperBitmapProvider بلر شده
+                  // فقط در صورت نیاز کمی rescale می‌کنیم
+                  float scale = Math.max(0.2f, Math.min(1f, BlurBubbleConfig.bitmapScale));
+                  int srcW = wallpaperBitmap.getWidth();
+                  int srcH = wallpaperBitmap.getHeight();
+                  int scaledW = Math.max(1, Math.round(srcW * scale));
+                  int scaledH = Math.max(1, Math.round(srcH * scale));
+
+                  if (scale == 1f) {
+                      blurredWallpaperBitmap = wallpaperBitmap;
+                  } else {
+                      blurredWallpaperBitmap = Bitmap.createScaledBitmap(wallpaperBitmap, scaledW, scaledH, true);
+                      blurredWallpaperBitmap = Bitmap.createScaledBitmap(blurredWallpaperBitmap, srcW, srcH, true);
+                  }
+              }
+
+              public static void drawBlurBubble(
+                      Canvas canvas,
+                      View parentView,
+                      Rect bubbleBounds,
+                      boolean isOut,
+                      boolean isSelected,
+                      Theme.ResourcesProvider resourcesProvider
+              ) {
+                  if (!BlurBubbleConfig.enabled || canvas == null || parentView == null || bubbleBounds == null) {
+                      return;
+                  }
+                  if (wallpaperBitmap == null) {
+                      return;
+                  }
+
+                  ensureBlurredWallpaper();
+                  if (blurredWallpaperBitmap == null) {
+                      return;
+                  }
+
+                  int l = bubbleBounds.left;
+                  int t = bubbleBounds.top;
+                  int r = bubbleBounds.right;
+                  int b = bubbleBounds.bottom;
+
+                  int w = r - l;
+                  int h = b - t;
+                  if (w <= 0 || h <= 0) {
+                      return;
+                  }
+
+                  buildBubblePath(l, t, r, b, isOut);
+
+                  int save = canvas.save();
+                  try {
+                      canvas.clipPath(bubblePath);
+
+                      Bitmap bmp = blurredWallpaperBitmap;
+                      Shader shader = new BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+
+                      shaderMatrix.reset();
+
+                      int[] loc = new int[2];
+                      parentView.getLocationOnScreen(loc);
+                      float bubbleScreenX = l + loc[0];
+                      float bubbleScreenY = t + loc[1];
+
+                      shaderMatrix.postTranslate(-bubbleScreenX, -bubbleScreenY);
+                      blurPaint.setShader(shader);
+                      blurPaint.getShader().setLocalMatrix(shaderMatrix);
+
+                      canvas.drawRect(l, t, r, b, blurPaint);
+
+                      int color;
+                      if (isOut) {
+                          color = isSelected
+                                  ? Theme.getColor(Theme.key_chat_outBubbleSelected, resourcesProvider)
+                                  : Theme.getColor(Theme.key_chat_outBubble, resourcesProvider);
+                      } else {
+                          color = isSelected
+                                  ? Theme.getColor(Theme.key_chat_inBubbleSelected, resourcesProvider)
+                                  : Theme.getColor(Theme.key_chat_inBubble, resourcesProvider);
+                      }
+
+                      int alpha = (int) (Color.alpha(color) * 0.55f);
+                      tintPaint.setColor(Color.argb(
+                              alpha,
+                              Color.red(color),
+                              Color.green(color),
+                              Color.blue(color)
+                      ));
+
+                      canvas.drawRect(l, t, r, b, tintPaint);
+
+                      int shadowKey = isOut
+                              ? Theme.key_chat_outBubbleShadow
+                              : Theme.key_chat_inBubbleShadow;
+                      borderPaint.setColor(Theme.getColor(shadowKey, resourcesProvider));
+                      canvas.drawPath(bubblePath, borderPaint);
+
+                  } catch (Exception ignore) {
+                  } finally {
+                      canvas.restoreToCount(save);
+                  }
+              }
+
+              private static void buildBubblePath(int l, int t, int r, int b, boolean isOut) {
+                  bubblePath.reset();
+                  float rad = AndroidUtilities.dp(17);
+                  float tw = AndroidUtilities.dp(9);
+                  float th = AndroidUtilities.dp(6);
+
+                  if (isOut) {
+                      float ri = r - tw;
+
+                      bubblePath.moveTo(l + rad, t);
+                      bubblePath.lineTo(ri - rad, t);
+                      bubblePath.quadTo(ri, t, ri, t + rad);
+                      bubblePath.lineTo(ri, b - rad - th);
+                      bubblePath.quadTo(ri, b - th / 2, r, b);
+                      bubblePath.quadTo(ri, b, ri - rad, b);
+                      bubblePath.lineTo(l + rad, b);
+                      bubblePath.quadTo(l, b, l, b - rad);
+                      bubblePath.lineTo(l, t + rad);
+                      bubblePath.quadTo(l, t, l + rad, t);
+                  } else {
+                      float le = l + tw;
+
+                      bubblePath.moveTo(le + rad, t);
+                      bubblePath.lineTo(r - rad, t);
+                      bubblePath.quadTo(r, t, r, t + rad);
+                      bubblePath.lineTo(r, b - rad);
+                      bubblePath.quadTo(r, b, r - rad, b);
+                      bubblePath.lineTo(le + rad, b);
+                      bubblePath.quadTo(le, b, l, b);
+                      bubblePath.quadTo(le, b - th / 2, le, b - rad - th);
+                      bubblePath.lineTo(le, t + rad);
+                      bubblePath.quadTo(le, t, le + rad, t);
+                  }
+
+                  bubblePath.close();
+              }
+          }
+          EOF
+
+      # بازنویسی WallpaperBitmapProvider تا والپیپر بلر را به RealBlurBubbleHelper بدهد
+      - name: Patch WallpaperBitmapProvider
+        run: |
+          cat > TMessagesProj/src/main/java/org/telegram/ui/Components/chat/WallpaperBitmapProvider.java << 'EOF'
+          package org.telegram.ui.Components.chat;
+
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Rect;
+          import android.graphics.drawable.BitmapDrawable;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.Drawable;
+
+          import org.telegram.messenger.Utilities;
+          import org.telegram.ui.ChatBackgroundDrawable;
+          import org.telegram.ui.Components.MotionBackgroundDrawable;
+          import org.telegram.ui.Components.blur3.source.BlurredBackgroundSource;
+          import org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceBitmap;
+          import org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceColor;
+          import org.telegram.ui.Components.blur3.source.BlurredBackgroundSourceWrapped;
+          import org.telegram.ui.Components.blur3.utils.BitmapMemoizedMetadata;
+          import org.telegram.ui.blur.RealBlurBubbleHelper;
+
+          public class WallpaperBitmapProvider {
+
+              private final BlurredBackgroundSourceColor sourceColor = new BlurredBackgroundSourceColor();
+              private final BlurredBackgroundSourceBitmap sourceBitmap = new BlurredBackgroundSourceBitmap();
+              private static final Rect tmpRect = new Rect();
+
+              private final BitmapMemoizedMetadata<Bitmap> blurredFromBitmap =
+                      new BitmapMemoizedMetadata<>(WallpaperBitmapProvider::blurBitmap);
+              private final BitmapMemoizedMetadata<Integer> navbarColorFromBitmap =
+                      new BitmapMemoizedMetadata<>(WallpaperBitmapProvider::averageBottomColor);
+
+              public BlurredBackgroundSource updateSourceFromBackgroundViewDrawable(Drawable drawable) {
+                  if (drawable instanceof ColorDrawable) {
+                      final int color = ((ColorDrawable) drawable).getColor();
+                      sourceColor.setColor(color);
+                      RealBlurBubbleHelper.updateWallpaper(null);
+                      return sourceColor;
+                  }
+                  if (drawable instanceof MotionBackgroundDrawable) {
+                      final MotionBackgroundDrawable motionDrawable = (MotionBackgroundDrawable) drawable;
+                      if (motionDrawable.getIntensity() < 0) {
+                          sourceColor.setColor(Color.BLACK);
+                          RealBlurBubbleHelper.updateWallpaper(null);
+                          return sourceColor;
+                      }
+                      sourceBitmap.setBitmap(motionDrawable.getBitmap());
+                      RealBlurBubbleHelper.updateWallpaper(sourceBitmap.getBitmap());
+                      return sourceBitmap;
+                  }
+                  if (drawable instanceof BitmapDrawable) {
+                      final Bitmap bitmap = blurredFromBitmap.get(((BitmapDrawable) drawable).getBitmap());
+                      sourceBitmap.setBitmap(bitmap);
+                      RealBlurBubbleHelper.updateWallpaper(bitmap);
+                      return sourceBitmap;
+                  }
+                  if (drawable instanceof ChatBackgroundDrawable) {
+                      ChatBackgroundDrawable chatDrawable = (ChatBackgroundDrawable) drawable;
+                      BlurredBackgroundSource source = updateSourceFromBackgroundViewDrawable(chatDrawable.getDrawable(false));
+                      return source;
+                  }
+                  if (drawable != null) {
+                      Canvas canvas = sourceBitmap.beginRecording(120, 160);
+                      tmpRect.set(drawable.getBounds());
+                      drawable.setBounds(0, 0, 120, 160);
+                      drawable.draw(canvas);
+                      drawable.setBounds(tmpRect);
+                      sourceBitmap.endRecording();
+                      sourceBitmap.setBitmap(blurredFromBitmap.get(sourceBitmap.getBitmap()));
+                      RealBlurBubbleHelper.updateWallpaper(sourceBitmap.getBitmap());
+                  } else {
+                      RealBlurBubbleHelper.updateWallpaper(null);
+                  }
+                  return sourceBitmap;
+              }
+
+              public int getNavigationBarColor(BlurredBackgroundSource source) {
+                  if (source instanceof BlurredBackgroundSourceColor) {
+                      return ((BlurredBackgroundSourceColor) source).getColor();
+                  }
+                  if (source instanceof BlurredBackgroundSourceBitmap) {
+                      final Bitmap bitmap = ((BlurredBackgroundSourceBitmap) source).getBitmap();
+                      return navbarColorFromBitmap.get(bitmap);
+                  }
+                  if (source instanceof BlurredBackgroundSourceWrapped) {
+                      return getNavigationBarColor(((BlurredBackgroundSourceWrapped) source).getSource());
+                  }
+                  return 0;
+              }
+
+              private static Bitmap blurBitmap(Bitmap bitmap) {
+                  if (bitmap == null || bitmap.isRecycled()) {
+                      return null;
+                  }
+                  final float scale = Math.max(bitmap.getWidth() / 90f, bitmap.getHeight() / 120f);
+                  final Bitmap result = Utilities.stackBlurBitmapWithScaleFactor(bitmap, scale);
+                  result.setHasAlpha(false);
+                  return result;
+              }
+
+              private static int averageBottomColor(Bitmap bitmap) {
+                  if (bitmap == null || bitmap.isRecycled()) {
+                      return 0;
+                  }
+                  int height = bitmap.getHeight();
+                  int width = bitmap.getWidth();
+                  int bottomHeight = (int) (height * 0.1f);
+                  int startY = height - bottomHeight;
+                  long sumR = 0, sumG = 0, sumB = 0, sumA = 0;
+                  int count = 0;
+                  int[] pixels = new int[width * bottomHeight];
+                  bitmap.getPixels(pixels, 0, width, 0, startY, width, bottomHeight);
+                  for (int color : pixels) {
+                      sumA += (color >>> 24) & 0xFF;
+                      sumR += (color >> 16) & 0xFF;
+                      sumG += (color >> 8) & 0xFF;
+                      sumB += color & 0xFF;
+                      count++;
+                  }
+                  if (count == 0) return Color.TRANSPARENT;
+                  int a = (int) (sumA / count);
+                  int r = (int) (sumR / count);
+                  int g = (int) (sumG / count);
+                  int b = (int) (sumB / count);
+                  return Color.argb(a, r, g, b);
+              }
+          }
+          EOF
+
+      # پچ خود ChatMessageCell: اضافه کردن import و صدا زدن drawBlurBubble
+      - name: Patch ChatMessageCell imports and drawBackgroundInternal
+        run: |
+          CHAT_CELL="TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java"
+
+          # اضافه کردن importها
+          sed -i '/package org.telegram.ui.Cells;/a\
+          \
+          import org.telegram.ui.blur.BlurBubbleConfig;\
+          import org.telegram.ui.blur.RealBlurBubbleHelper;\
+          ' "$CHAT_CELL"
+
+          # اضافه کردن فراخوانی drawBlurBubble بعد از restoreCount
+          sed -i '/int restoreCount = canvas.getSaveCount();/a\
+              if (BlurBubbleConfig.enabled && getParent() instanceof android.view.View && currentBackgroundDrawable != null && currentMessageObject != null) {\
+                  boolean isOut = currentMessageObject.isOutOwner();\
+                  boolean shouldBlur = isOut ? BlurBubbleConfig.shouldBlurOutgoing() : BlurBubbleConfig.shouldBlurIncoming();\
+                  if (shouldBlur) {\
+                      android.graphics.Rect bounds = currentBackgroundDrawable.getBounds();\
+                      RealBlurBubbleHelper.drawBlurBubble(\
+                              canvas,\
+                              (android.view.View) getParent(),\
+                              bounds,\
+                              isOut,\
+                              isDrawSelectionBackground(),\
+                              resourcesProvider\
+                      );\
+                  }\
+              }\
+          ' "$CHAT_CELL"
+
+      # بیلد با Dockerfile رسمی تلگرام
+      - name: Build Docker image
+        run: docker build -t telegram-build .
+
+      - name: Build APKs via Docker
+        run: docker run --rm -v "$PWD":/home/source telegram-build
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-blurclient-apks
+          path: |
+            TMessagesProj/build/outputs/apk/**/*.apk
+            TMessagesProj/build/outputs/bundle/**/*.aab
+          if-no-files-found: warn
