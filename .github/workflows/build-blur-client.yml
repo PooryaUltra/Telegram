@@ -1,3 +1,29 @@
+      - name: Super Cleanup to free disk
+        run: |
+          echo "Before cleanup:"
+          df -h
+
+          # Remove .NET
+          sudo rm -rf /usr/share/dotnet
+
+          # Remove Android emulator
+          sudo rm -rf /usr/local/lib/android/sdk/emulator
+
+          # Remove older NDKs (keep only 21)
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/*
+          
+          # Remove large hosted toolcache
+          sudo rm -rf /opt/hostedtoolcache/*
+
+          # Remove PowerShell
+          sudo rm -rf /usr/local/share/powershell
+
+          # Remove node global modules
+          sudo rm -rf /usr/local/lib/node_modules
+
+          echo "After cleanup:"
+          df -h
+
 name: Build Telegram Blur Client
 
 on:
