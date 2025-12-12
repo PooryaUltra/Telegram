@@ -6,73 +6,111 @@ on:
       - ".github/workflows/build-blur-client.yml"
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Free Disk Space (safe)
-        shell: bash
+      # آزاد کردن فضا (امن)
+      - name: Super Cleanup to free disk
         run: |
-          set -euxo pipefail
+          echo "Before cleanup:"
           df -h
+
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /usr/local/lib/android/sdk/emulator || true
           sudo rm -rf /usr/local/lib/android/sdk/system-images || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
           sudo rm -rf /opt/ghc || true
           sudo rm -rf /usr/local/.ghcup || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/* || true
+
+          echo "After cleanup:"
           df -h
 
-      - name: Set up JDK 21
+      # نصب کنار تلگرام اصلی
+      - name: Change APP_PACKAGE so it installs alongside official Telegram
+        run: |
+          if grep -q '^APP_PACKAGE=' gradle.properties; then
+            sed -i 's/^APP_PACKAGE=.*/APP_PACKAGE=org.telegram.messenger.blurclient/' gradle.properties
+          else
+            echo 'APP_PACKAGE=org.telegram.messenger.blurclient' >> gradle.properties
+          fi
+          echo "Current APP_PACKAGE:"
+          grep '^APP_PACKAGE=' gradle.properties || true
+
+      # حذف google-services (Firebase)
+      - name: Disable Google Services plugin
+        run: |
+          FILE="TMessagesProj_App/build.gradle"
+          if [ -f "$FILE" ]; then
+            sed -i "s/apply plugin: 'com.google.gms.google-services'//g" "$FILE"
+            sed -i 's/apply plugin: \"com.google.gms.google-services\"//g' "$FILE"
+          fi
+
+      # بیلد تول 35 مشکل‌سازه
+      - name: Patch buildToolsVersion to 34.0.0
+        run: |
+          for FILE in TMessagesProj_App/build.gradle TMessagesProj/build.gradle; do
+            if [ -f "$FILE" ]; then
+              sed -i "s/buildToolsVersion '35.0.0'/buildToolsVersion '34.0.0'/g" "$FILE" || true
+              sed -i 's/buildToolsVersion "35.0.0"/buildToolsVersion "34.0.0"/g' "$FILE" || true
+            fi
+          done
+
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "17"
 
-      - name: Gradle cache
-        uses: gradle/actions/setup-gradle@v3
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Apply Real Blur patches (robust)
-        shell: bash
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;34.0.0" "ndk;21.4.7075529"
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # ---------- RenderEffect helper files ----------
+      - name: Add RenderEffect blur helpers
         run: |
           set -euxo pipefail
-
           mkdir -p TMessagesProj/src/main/java/org/telegram/ui/blur
 
-          cat > TMessagesProj/src/main/java/org/telegram/ui/blur/BlurBubbleConfig.java <<'JAVA'
+          cat > TMessagesProj/src/main/java/org/telegram/ui/blur/BlurBubbleConfig.java << 'JAVA'
           package org.telegram.ui.blur;
 
           public final class BlurBubbleConfig {
               private BlurBubbleConfig() {}
 
-              public static boolean blurEnabled = true;
+              public static boolean enabled = true;
               public static boolean blurIncoming = true;
               public static boolean blurOutgoing = true;
 
-              // RenderEffect radius is in PX
-              public static float blurRadiusPx = 26f;
+              // RenderEffect radius in PX (Android 12+). Try 18..40
+              public static float blurRadiusPx = 28f;
 
-              // How opaque the normal bubble is on top of blur (0..1)
-              public static float overlayAlpha = 0.30f;
+              // Bubble overlay alpha (0..1). Lower => more blur visible
+              public static float overlayAlpha = 0.32f;
 
-              public static boolean shouldBlurIncoming() { return blurEnabled && blurIncoming; }
-              public static boolean shouldBlurOutgoing() { return blurEnabled && blurOutgoing; }
+              public static boolean shouldBlurIncoming() { return enabled && blurIncoming; }
+              public static boolean shouldBlurOutgoing() { return enabled && blurOutgoing; }
 
               public static float getBlurRadiusPx() { return blurRadiusPx; }
               public static float getOverlayAlpha() { return overlayAlpha; }
           }
           JAVA
 
-          cat > TMessagesProj/src/main/java/org/telegram/ui/blur/RealBlurBubbleHelper.java <<'JAVA'
+          cat > TMessagesProj/src/main/java/org/telegram/ui/blur/RealBlurBubbleHelper.java << 'JAVA'
           package org.telegram.ui.blur;
 
           import android.graphics.Bitmap;
@@ -90,8 +128,8 @@ jobs:
           import java.lang.ref.WeakReference;
 
           public final class RealBlurBubbleHelper {
-
               private static final Paint blurPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+
               private static Bitmap cacheBitmap;
               private static Canvas cacheCanvas;
               private static int cacheW, cacheH;
@@ -119,7 +157,7 @@ jobs:
 
               private static void captureIfNeeded(View v) {
                   long now = SystemClock.uptimeMillis();
-                  if (now - lastCaptureTime < 33) return; // ~30fps throttle
+                  if (now - lastCaptureTime < 33) return; // throttle ~30fps
                   lastCaptureTime = now;
 
                   cacheBitmap.eraseColor(0);
@@ -130,11 +168,11 @@ jobs:
                       Canvas cellCanvas,
                       View parentView,
                       Rect bubbleBoundsInCell,
-                      int bubbleAbsLeft,
-                      int bubbleAbsTop,
+                      int bubbleAbsLeftInParent,
+                      int bubbleAbsTopInParent,
                       Theme.MessageDrawable bubbleDrawable
               ) {
-                  if (!BlurBubbleConfig.blurEnabled) return false;
+                  if (!BlurBubbleConfig.enabled) return false;
                   if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false;
                   if (parentView == null || bubbleDrawable == null || bubbleBoundsInCell == null) return false;
                   if (!ensureCache(parentView)) return false;
@@ -145,12 +183,11 @@ jobs:
                   blurPaint.setRenderEffect(RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP));
 
                   Rect src = new Rect(
-                          bubbleAbsLeft,
-                          bubbleAbsTop,
-                          bubbleAbsLeft + bubbleBoundsInCell.width(),
-                          bubbleAbsTop + bubbleBoundsInCell.height()
+                          bubbleAbsLeftInParent,
+                          bubbleAbsTopInParent,
+                          bubbleAbsLeftInParent + bubbleBoundsInCell.width(),
+                          bubbleAbsTopInParent + bubbleBoundsInCell.height()
                   );
-
                   Rect dst = new Rect(
                           bubbleBoundsInCell.left,
                           bubbleBoundsInCell.top,
@@ -170,100 +207,81 @@ jobs:
           }
           JAVA
 
+      # ---------- Patch ChatMessageCell by INSERT (نه replace) ----------
+      - name: Patch ChatMessageCell (insert RenderEffect blur at bubble draw)
+        run: |
+          set -euxo pipefail
           python3 - <<'PY'
           import re, pathlib
 
           p = pathlib.Path("TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java")
           s = p.read_text(encoding="utf-8", errors="replace")
 
-          # 1) Ensure imports exist (add near other org.telegram.ui imports)
+          # Add imports (once)
           if "org.telegram.ui.blur.RealBlurBubbleHelper" not in s:
-              s = s.replace(
-                  "import org.telegram.ui.PhotoViewer;",
-                  "import org.telegram.ui.PhotoViewer;\nimport org.telegram.ui.blur.BlurBubbleConfig;\nimport org.telegram.ui.blur.RealBlurBubbleHelper;"
-              )
+              # put near other org.telegram.ui imports (safe anchor)
+              anchor = "import org.telegram.ui.PhotoViewer;"
+              if anchor in s:
+                  s = s.replace(anchor, anchor + "\nimport org.telegram.ui.blur.BlurBubbleConfig;\nimport org.telegram.ui.blur.RealBlurBubbleHelper;")
+              else:
+                  # fallback: after package line
+                  s = re.sub(r"(package\s+org\.telegram\.ui\.Cells;\s*)", r"\1\nimport org.telegram.ui.blur.BlurBubbleConfig;\nimport org.telegram.ui.blur.RealBlurBubbleHelper;\n", s, count=1)
 
-          # 2) Replace ANY existing blur block (Nekogram or our earlier injections) robustly
-          # Try 2 patterns:
-          # A) With markers
-          marker_pat = re.compile(r"//\s*.*?Blur\s+Bubbles.*?End\s+.*?Blur\s+Bubbles", re.S)
-          # B) Without markers: from 'boolean blurDrawn = false;' up to the next blank line after it
-          fallback_pat = re.compile(r"\n\s*boolean\s+blurDrawn\s*=\s*false\s*;.*?\n\s*(?=\n\s*\w|\n\s*if|\n\s*//|\n\s*currentSelectedBackgroundAlpha)", re.S)
+          # If already patched, do nothing
+          if "RealBlurBubbleHelper.drawBlurIntoBubble" in s:
+              p.write_text(s, encoding="utf-8")
+              print("Already patched.")
+              raise SystemExit(0)
 
-          repl = r"""
-              // Real Blur Bubbles (RenderEffect, Android 12+)
-              boolean blurDrawn = false;
-              if (BlurBubbleConfig.blurEnabled && getParent() instanceof android.view.View && currentBackgroundDrawable != null) {
-                  android.view.View parentView = (android.view.View) getParent();
-                  boolean isOutgoing = currentMessageObject != null && currentMessageObject.isOutOwner();
-                  boolean shouldBlur = isOutgoing ? BlurBubbleConfig.shouldBlurOutgoing() : BlurBubbleConfig.shouldBlurIncoming();
-                  if (shouldBlur) {
-                      android.graphics.Rect bounds = currentBackgroundDrawable.getBounds();
-                      int absLeft = bounds.left + getLeft();
-                      int absTop  = bounds.top  + getTop();
-                      blurDrawn = RealBlurBubbleHelper.drawBlurIntoBubble(
-                          canvas,
-                          parentView,
-                          bounds,
-                          absLeft,
-                          absTop,
-                          currentBackgroundDrawable
-                      );
-                  }
-              }
-              // End Real Blur Bubbles
-          """
+          # Insert blurDrawn + render blur BEFORE setAlpha/drawCached of background bubble
+          # We target the exact stable sequence that exists in your file:
+          #   currentSelectedBackgroundAlpha = 0;
+          #   currentBackgroundDrawable.setAlpha((int) (255 * alphaInternal));
+          #   currentBackgroundDrawable.drawCached(...)
+          pat = re.compile(
+              r"(currentSelectedBackgroundAlpha\s*=\s*0;\s*\n\s*)"
+              r"(currentBackgroundDrawable\.setAlpha\(\(int\)\s*\(255\s*\*\s*alphaInternal\)\);\s*\n\s*)",
+              re.M
+          )
 
-          replaced = False
+          repl = r"""\1boolean blurDrawn = false;
+                if (BlurBubbleConfig.enabled && getParent() instanceof android.view.View && currentBackgroundDrawable != null) {
+                    android.view.View parentView = (android.view.View) getParent();
+                    boolean isOutgoing = currentMessageObject != null && currentMessageObject.isOutOwner();
+                    boolean shouldBlur = isOutgoing ? BlurBubbleConfig.shouldBlurOutgoing() : BlurBubbleConfig.shouldBlurIncoming();
+                    if (shouldBlur) {
+                        android.graphics.Rect bounds = currentBackgroundDrawable.getBounds();
+                        int absLeft = bounds.left + getLeft();
+                        int absTop  = bounds.top  + getTop();
+                        blurDrawn = RealBlurBubbleHelper.drawBlurIntoBubble(
+                                canvas,
+                                parentView,
+                                bounds,
+                                absLeft,
+                                absTop,
+                                currentBackgroundDrawable
+                        );
+                    }
+                }
+                if (blurDrawn) {
+                    alphaInternal *= BlurBubbleConfig.getOverlayAlpha();
+                }
+                \2"""
 
-          # Prefer replacing the Nekogram helper call if it exists
-          if "BlurBubbleHelper.drawBlurBubble" in s or "BlurBubbleHelper.blurEnabled" in s:
-              # Replace the whole region that contains the helper call (best-effort)
-              block_pat = re.compile(r"(\s*//.*?Blur.*?Bubbles.*?\n)?\s*boolean\s+blurDrawn\s*=\s*false\s*;.*?BlurBubbleHelper\.drawBlurBubble.*?\n.*?(//\s*End.*?Bubbles.*?\n)?", re.S)
-              s2, n = block_pat.subn(repl, s, count=1)
-              if n:
-                  s = s2
-                  replaced = True
+          s2, n = pat.subn(repl, s, count=1)
+          if n == 0:
+              raise SystemExit("Patch failed: could not find the alpha/setAlpha anchor in ChatMessageCell.java")
 
-          if not replaced:
-              # Try marker region
-              s2, n = marker_pat.subn(repl, s, count=1)
-              if n:
-                  s = s2
-                  replaced = True
-
-          if not replaced:
-              # Try fallback
-              s2, n = fallback_pat.subn("\n"+repl+"\n", s, count=1)
-              if n:
-                  s = s2
-                  replaced = True
-
-          if not replaced:
-              raise SystemExit("Could not find a blur block to replace (no markers / no blurDrawn).")
-
-          # 3) Inject overlay alpha right before setAlpha(255 * alphaInternal) (first occurrence only)
-          alpha_line = "currentBackgroundDrawable.setAlpha((int) (255 * alphaInternal));"
-          idx = s.find(alpha_line)
-          if idx == -1:
-              raise SystemExit("Could not find currentBackgroundDrawable.setAlpha((int) (255 * alphaInternal));")
-
-          inject = "if (blurDrawn) { alphaInternal *= BlurBubbleConfig.getOverlayAlpha(); }\n                "
-          s = s.replace(alpha_line, inject + alpha_line, 1)
-
-          p.write_text(s, encoding="utf-8")
-          print("ChatMessageCell patched OK")
+          p.write_text(s2, encoding="utf-8")
+          print("Patched ChatMessageCell OK")
           PY
 
-      - name: Build APK (afatRelease)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          ./gradlew --no-daemon :TMessagesProj_App:assembleAfatRelease
+      - name: Build afatRelease APK (universal)
+        run: ./gradlew :TMessagesProj_App:assembleAfatRelease --no-daemon --stacktrace
 
       - name: Upload universal APK
         uses: actions/upload-artifact@v4
         with:
-          name: TelegramBlur-universal
+          name: apk-universal
           path: "**/afat/release/*.apk"
           if-no-files-found: error
