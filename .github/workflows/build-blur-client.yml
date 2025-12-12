@@ -45,6 +45,30 @@ jobs:
         shell: bash
         run: chmod +x ./gradlew
 
+      # --- PRIVATE Telegram API credentials (DO NOT HARDCODE) ---
+      - name: Inject Telegram API credentials (from GitHub Secrets)
+        shell: bash
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          set -euxo pipefail
+          test -n "${TELEGRAM_API_ID}"
+          test -n "${TELEGRAM_API_HASH}"
+
+          # Keep them out of repo files; use local.properties in CI only
+          if [ -f local.properties ]; then
+            rm -f local.properties
+          fi
+
+          cat > local.properties <<EOF
+          telegram.api_id=${TELEGRAM_API_ID}
+          telegram.api_hash=${TELEGRAM_API_HASH}
+          EOF
+
+          # Make sure gradle can read local.properties (most projects do)
+          # If your project expects different keys/paths, tell me اسم فایل/کلیدها رو.
+
       - name: Set package name (install alongside official Telegram)
         shell: bash
         run: |
@@ -60,7 +84,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # Remove apply plugin lines if present
           for f in TMessagesProj_App/build.gradle TMessagesProj/build.gradle; do
             if [ -f "$f" ]; then
               sed -i "s/apply plugin: 'com.google.gms.google-services'//g" "$f" || true
@@ -70,6 +93,7 @@ jobs:
             fi
           done
 
+      # --- BLUR FILES (injected into source during CI build) ---
       - name: Add Real Blur helpers (RenderNode + RenderEffect)
         shell: bash
         run: |
@@ -86,15 +110,14 @@ jobs:
               public static boolean blurIncoming = true;
               public static boolean blurOutgoing = true;
 
-              // RenderEffect radius in PX (Android 12+). Try 18..40
+              // RenderEffect radius in PX (Android 12+). Similar feel to Telegram UI blurs.
               public static float blurRadiusPx = 28f;
 
-              // Bubble overlay alpha (0..1). Lower => more blur visible
+              // Bubble overlay alpha (0..1). Lower => blur looks stronger.
               public static float overlayAlpha = 0.32f;
 
               public static boolean shouldBlurIncoming() { return enabled && blurIncoming; }
               public static boolean shouldBlurOutgoing() { return enabled && blurOutgoing; }
-
               public static float getBlurRadiusPx() { return blurRadiusPx; }
               public static float getOverlayAlpha() { return overlayAlpha; }
           }
@@ -118,7 +141,6 @@ jobs:
           import java.lang.ref.WeakReference;
 
           public final class RealBlurBubbleHelper {
-
               private static Bitmap cacheBitmap;
               private static Canvas cacheCanvas;
               private static int cacheW, cacheH;
@@ -144,9 +166,11 @@ jobs:
                       lastViewRef = new WeakReference<>(v);
                       lastCaptureTime = 0;
                   }
+
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && blurNode == null) {
                       blurNode = new RenderNode("blurBubbleNode");
                   }
+
                   return true;
               }
 
@@ -154,11 +178,14 @@ jobs:
                   long now = SystemClock.uptimeMillis();
                   if (now - lastCaptureTime < 33) return; // ~30fps throttle
                   lastCaptureTime = now;
-
                   cacheBitmap.eraseColor(0);
                   v.draw(cacheCanvas);
               }
 
+              /**
+               * Draws a blurred snapshot of parentView into the bubble shape area.
+               * Returns true if blur was drawn.
+               */
               public static boolean drawBlurIntoBubble(
                       Canvas cellCanvas,
                       View parentView,
@@ -170,8 +197,8 @@ jobs:
                   if (!BlurBubbleConfig.enabled) return false;
                   if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false;
                   if (parentView == null || bubbleDrawable == null || bubbleBoundsInCell == null) return false;
-                  if (!ensureCache(parentView)) return false;
 
+                  if (!ensureCache(parentView)) return false;
                   captureIfNeeded(parentView);
 
                   int w = bubbleBoundsInCell.width();
@@ -186,6 +213,7 @@ jobs:
                   );
 
                   float r = BlurBubbleConfig.getBlurRadiusPx();
+
                   blurNode.setPosition(0, 0, w, h);
                   blurNode.setRenderEffect(RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP));
 
@@ -201,6 +229,7 @@ jobs:
                   } finally {
                       cellCanvas.restoreToCount(save);
                   }
+
                   return true;
               }
           }
@@ -222,15 +251,17 @@ jobs:
               if anchor in s:
                   s = s.replace(anchor, anchor + "\nimport org.telegram.ui.blur.BlurBubbleConfig;\nimport org.telegram.ui.blur.RealBlurBubbleHelper;")
               else:
-                  s = re.sub(r"(package\s+org\.telegram\.ui\.Cells;\s*)", r"\1\nimport org.telegram.ui.blur.BlurBubbleConfig;\nimport org.telegram.ui.blur.RealBlurBubbleHelper;\n", s, count=1)
+                  s = re.sub(r"(package\s+org\.telegram\.ui\.Cells;\s*)",
+                             r"\1\nimport org.telegram.ui.blur.BlurBubbleConfig;\nimport org.telegram.ui.blur.RealBlurBubbleHelper;\n",
+                             s, count=1)
 
-          # If already patched, skip
+          # If already patched, keep file as-is
           if "RealBlurBubbleHelper.drawBlurIntoBubble" in s:
               p.write_text(s, encoding="utf-8")
               print("Already patched.")
               raise SystemExit(0)
 
-          # Insert before bubble alpha set (stable anchor in this repo)
+          # Insert before bubble alpha set (anchor used in this repo)
           pat = re.compile(
               r"(currentSelectedBackgroundAlpha\s*=\s*0;\s*\n\s*)"
               r"(currentBackgroundDrawable\.setAlpha\(\(int\)\s*\(255\s*\*\s*alphaInternal\)\);\s*\n\s*)",
@@ -238,28 +269,23 @@ jobs:
           )
 
           repl = r"""\1boolean blurDrawn = false;
-                if (BlurBubbleConfig.enabled && getParent() instanceof android.view.View && currentBackgroundDrawable != null) {
-                    android.view.View parentView = (android.view.View) getParent();
-                    boolean isOutgoing = currentMessageObject != null && currentMessageObject.isOutOwner();
-                    boolean shouldBlur = isOutgoing ? BlurBubbleConfig.shouldBlurOutgoing() : BlurBubbleConfig.shouldBlurIncoming();
-                    if (shouldBlur) {
-                        android.graphics.Rect bounds = currentBackgroundDrawable.getBounds();
-                        int absLeft = bounds.left + getLeft();
-                        int absTop  = bounds.top  + getTop();
-                        blurDrawn = RealBlurBubbleHelper.drawBlurIntoBubble(
-                                canvas,
-                                parentView,
-                                bounds,
-                                absLeft,
-                                absTop,
-                                currentBackgroundDrawable
-                        );
-                    }
-                }
-                if (blurDrawn) {
-                    alphaInternal *= BlurBubbleConfig.getOverlayAlpha();
-                }
-                \2"""
+          if (BlurBubbleConfig.enabled && getParent() instanceof android.view.View && currentBackgroundDrawable != null) {
+              android.view.View parentView = (android.view.View) getParent();
+              boolean isOutgoing = currentMessageObject != null && currentMessageObject.isOutOwner();
+              boolean shouldBlur = isOutgoing ? BlurBubbleConfig.shouldBlurOutgoing() : BlurBubbleConfig.shouldBlurIncoming();
+              if (shouldBlur) {
+                  android.graphics.Rect bounds = currentBackgroundDrawable.getBounds();
+                  int absLeft = bounds.left + getLeft();
+                  int absTop = bounds.top + getTop();
+                  blurDrawn = RealBlurBubbleHelper.drawBlurIntoBubble(
+                      canvas, parentView, bounds, absLeft, absTop, currentBackgroundDrawable
+                  );
+              }
+          }
+          if (blurDrawn) {
+              alphaInternal *= BlurBubbleConfig.getOverlayAlpha();
+          }
+          \2"""
 
           s2, n = pat.subn(repl, s, count=1)
           if n == 0:
