@@ -1,30 +1,46 @@
-name: Build Telegram Blur Client
+name: Android CI Build (Telegram)
 
 on:
-  push:
-    paths:
-      - ".github/workflows/build-blur-client.yml"
   workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
 
-permissions:
-  contents: read
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
+    name: Build APK
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      # ⚠️ HARDCODED – keep repo PRIVATE
+      TELEGRAM_API_ID: "26931698"
+      TELEGRAM_API_HASH: "859d6678660fc4b6bb04f7135d4329a2"
+      GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dkotlin.daemon.jvm.options=-Xmx2g -Dfile.encoding=UTF-8"
+      JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF-8"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
 
-      - name: Free disk space (safe)
+      - name: Show disk usage (before)
         shell: bash
         run: |
-          set -euxo pipefail
           df -h
+          free -h
+
+      - name: Free disk space
+        shell: bash
+        run: |
           sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/local/lib/android/sdk/emulator || true
-          sudo rm -rf /usr/local/lib/android/sdk/system-images || true
           sudo rm -rf /opt/ghc || true
           sudo rm -rf /usr/local/.ghcup || true
           sudo rm -rf /opt/hostedtoolcache/CodeQL || true
@@ -32,292 +48,66 @@ jobs:
           sudo rm -rf /var/lib/apt/lists/* || true
           df -h
 
-      - name: Set up JDK 21
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "17"
+          cache: gradle
 
-      - name: Setup Gradle cache
+      - name: Setup Gradle (extra cache)
         uses: gradle/actions/setup-gradle@v3
+        with:
+          cache-read-only: false
 
       - name: Make gradlew executable
         shell: bash
         run: chmod +x ./gradlew
 
-      # --- PRIVATE Telegram API credentials (DO NOT HARDCODE) ---
-      - name: Inject Telegram API credentials (from GitHub Secrets)
+      - name: Write local.properties (Telegram API keys)
         shell: bash
-        env:
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: |
-          set -euxo pipefail
-          test -n "${TELEGRAM_API_ID}"
-          test -n "${TELEGRAM_API_HASH}"
-
-          # Keep them out of repo files; use local.properties in CI only
-          if [ -f local.properties ]; then
-            rm -f local.properties
-          fi
-
+          rm -f local.properties
           cat > local.properties <<EOF
           telegram.api_id=${TELEGRAM_API_ID}
           telegram.api_hash=${TELEGRAM_API_HASH}
           EOF
+          echo "local.properties created:"
+          cat local.properties
 
-          # Make sure gradle can read local.properties (most projects do)
-          # If your project expects different keys/paths, tell me اسم فایل/کلیدها رو.
-
-      - name: Set package name (install alongside official Telegram)
+      - name: Gradle info
         shell: bash
         run: |
-          set -euxo pipefail
-          if grep -q '^APP_PACKAGE=' gradle.properties; then
-            sed -i 's/^APP_PACKAGE=.*/APP_PACKAGE=org.telegram.messenger.blurclient/' gradle.properties
-          else
-            echo 'APP_PACKAGE=org.telegram.messenger.blurclient' >> gradle.properties
-          fi
-          grep '^APP_PACKAGE=' gradle.properties
+          ./gradlew --version
+          java -version
 
-      - name: Disable Google services / Crashlytics plugins (avoid missing configs)
+      - name: Clean
         shell: bash
         run: |
-          set -euxo pipefail
-          for f in TMessagesProj_App/build.gradle TMessagesProj/build.gradle; do
-            if [ -f "$f" ]; then
-              sed -i "s/apply plugin: 'com.google.gms.google-services'//g" "$f" || true
-              sed -i 's/apply plugin: "com.google.gms.google-services"//g' "$f" || true
-              sed -i "s/apply plugin: 'com.google.firebase.crashlytics'//g" "$f" || true
-              sed -i 's/apply plugin: "com.google.firebase.crashlytics"//g' "$f" || true
-            fi
-          done
+          ./gradlew --no-daemon clean
 
-      # --- BLUR FILES (injected into source during CI build) ---
-      - name: Add Real Blur helpers (RenderNode + RenderEffect)
+      - name: Build (Afat Release)
         shell: bash
         run: |
-          set -euxo pipefail
-          mkdir -p TMessagesProj/src/main/java/org/telegram/ui/blur
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace --info :TMessagesProj_App:assembleAfatRelease | tee build.log
 
-          cat > TMessagesProj/src/main/java/org/telegram/ui/blur/BlurBubbleConfig.java <<'JAVA'
-          package org.telegram.ui.blur;
-
-          public final class BlurBubbleConfig {
-              private BlurBubbleConfig() {}
-
-              public static boolean enabled = true;
-              public static boolean blurIncoming = true;
-              public static boolean blurOutgoing = true;
-
-              // RenderEffect radius in PX (Android 12+). Similar feel to Telegram UI blurs.
-              public static float blurRadiusPx = 28f;
-
-              // Bubble overlay alpha (0..1). Lower => blur looks stronger.
-              public static float overlayAlpha = 0.32f;
-
-              public static boolean shouldBlurIncoming() { return enabled && blurIncoming; }
-              public static boolean shouldBlurOutgoing() { return enabled && blurOutgoing; }
-              public static float getBlurRadiusPx() { return blurRadiusPx; }
-              public static float getOverlayAlpha() { return overlayAlpha; }
-          }
-          JAVA
-
-          cat > TMessagesProj/src/main/java/org/telegram/ui/blur/RealBlurBubbleHelper.java <<'JAVA'
-          package org.telegram.ui.blur;
-
-          import android.graphics.Bitmap;
-          import android.graphics.Canvas;
-          import android.graphics.Rect;
-          import android.graphics.RenderEffect;
-          import android.graphics.RenderNode;
-          import android.graphics.Shader;
-          import android.os.Build;
-          import android.os.SystemClock;
-          import android.view.View;
-
-          import org.telegram.ui.ActionBar.Theme;
-
-          import java.lang.ref.WeakReference;
-
-          public final class RealBlurBubbleHelper {
-              private static Bitmap cacheBitmap;
-              private static Canvas cacheCanvas;
-              private static int cacheW, cacheH;
-              private static long lastCaptureTime;
-              private static WeakReference<View> lastViewRef = new WeakReference<>(null);
-
-              // API 31+
-              private static RenderNode blurNode;
-
-              private RealBlurBubbleHelper() {}
-
-              private static boolean ensureCache(View v) {
-                  int w = v.getWidth();
-                  int h = v.getHeight();
-                  if (w <= 0 || h <= 0) return false;
-
-                  View last = lastViewRef.get();
-                  if (cacheBitmap == null || cacheCanvas == null || w != cacheW || h != cacheH || last != v) {
-                      cacheW = w;
-                      cacheH = h;
-                      cacheBitmap = Bitmap.createBitmap(cacheW, cacheH, Bitmap.Config.ARGB_8888);
-                      cacheCanvas = new Canvas(cacheBitmap);
-                      lastViewRef = new WeakReference<>(v);
-                      lastCaptureTime = 0;
-                  }
-
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && blurNode == null) {
-                      blurNode = new RenderNode("blurBubbleNode");
-                  }
-
-                  return true;
-              }
-
-              private static void captureIfNeeded(View v) {
-                  long now = SystemClock.uptimeMillis();
-                  if (now - lastCaptureTime < 33) return; // ~30fps throttle
-                  lastCaptureTime = now;
-                  cacheBitmap.eraseColor(0);
-                  v.draw(cacheCanvas);
-              }
-
-              /**
-               * Draws a blurred snapshot of parentView into the bubble shape area.
-               * Returns true if blur was drawn.
-               */
-              public static boolean drawBlurIntoBubble(
-                      Canvas cellCanvas,
-                      View parentView,
-                      Rect bubbleBoundsInCell,
-                      int bubbleAbsLeftInParent,
-                      int bubbleAbsTopInParent,
-                      Theme.MessageDrawable bubbleDrawable
-              ) {
-                  if (!BlurBubbleConfig.enabled) return false;
-                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false;
-                  if (parentView == null || bubbleDrawable == null || bubbleBoundsInCell == null) return false;
-
-                  if (!ensureCache(parentView)) return false;
-                  captureIfNeeded(parentView);
-
-                  int w = bubbleBoundsInCell.width();
-                  int h = bubbleBoundsInCell.height();
-                  if (w <= 0 || h <= 0) return false;
-
-                  Rect src = new Rect(
-                          bubbleAbsLeftInParent,
-                          bubbleAbsTopInParent,
-                          bubbleAbsLeftInParent + w,
-                          bubbleAbsTopInParent + h
-                  );
-
-                  float r = BlurBubbleConfig.getBlurRadiusPx();
-
-                  blurNode.setPosition(0, 0, w, h);
-                  blurNode.setRenderEffect(RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP));
-
-                  Canvas rc = blurNode.beginRecording(w, h);
-                  rc.drawBitmap(cacheBitmap, src, new Rect(0, 0, w, h), null);
-                  blurNode.endRecording();
-
-                  int save = cellCanvas.save();
-                  try {
-                      cellCanvas.clipPath(bubbleDrawable.makePath());
-                      cellCanvas.translate(bubbleBoundsInCell.left, bubbleBoundsInCell.top);
-                      cellCanvas.drawRenderNode(blurNode);
-                  } finally {
-                      cellCanvas.restoreToCount(save);
-                  }
-
-                  return true;
-              }
-          }
-          JAVA
-
-      - name: Patch ChatMessageCell (insert blur at bubble draw)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python3 - <<'PY'
-          import re, pathlib
-
-          p = pathlib.Path("TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java")
-          s = p.read_text(encoding="utf-8", errors="replace")
-
-          # Add imports once
-          if "org.telegram.ui.blur.RealBlurBubbleHelper" not in s:
-              anchor = "import org.telegram.ui.PhotoViewer;"
-              if anchor in s:
-                  s = s.replace(anchor, anchor + "\nimport org.telegram.ui.blur.BlurBubbleConfig;\nimport org.telegram.ui.blur.RealBlurBubbleHelper;")
-              else:
-                  s = re.sub(r"(package\s+org\.telegram\.ui\.Cells;\s*)",
-                             r"\1\nimport org.telegram.ui.blur.BlurBubbleConfig;\nimport org.telegram.ui.blur.RealBlurBubbleHelper;\n",
-                             s, count=1)
-
-          # If already patched, keep file as-is
-          if "RealBlurBubbleHelper.drawBlurIntoBubble" in s:
-              p.write_text(s, encoding="utf-8")
-              print("Already patched.")
-              raise SystemExit(0)
-
-          # Insert before bubble alpha set (anchor used in this repo)
-          pat = re.compile(
-              r"(currentSelectedBackgroundAlpha\s*=\s*0;\s*\n\s*)"
-              r"(currentBackgroundDrawable\.setAlpha\(\(int\)\s*\(255\s*\*\s*alphaInternal\)\);\s*\n\s*)",
-              re.M
-          )
-
-          repl = r"""\1boolean blurDrawn = false;
-          if (BlurBubbleConfig.enabled && getParent() instanceof android.view.View && currentBackgroundDrawable != null) {
-              android.view.View parentView = (android.view.View) getParent();
-              boolean isOutgoing = currentMessageObject != null && currentMessageObject.isOutOwner();
-              boolean shouldBlur = isOutgoing ? BlurBubbleConfig.shouldBlurOutgoing() : BlurBubbleConfig.shouldBlurIncoming();
-              if (shouldBlur) {
-                  android.graphics.Rect bounds = currentBackgroundDrawable.getBounds();
-                  int absLeft = bounds.left + getLeft();
-                  int absTop = bounds.top + getTop();
-                  blurDrawn = RealBlurBubbleHelper.drawBlurIntoBubble(
-                      canvas, parentView, bounds, absLeft, absTop, currentBackgroundDrawable
-                  );
-              }
-          }
-          if (blurDrawn) {
-              alphaInternal *= BlurBubbleConfig.getOverlayAlpha();
-          }
-          \2"""
-
-          s2, n = pat.subn(repl, s, count=1)
-          if n == 0:
-              raise SystemExit("Patch failed: could not find the alpha/setAlpha anchor in ChatMessageCell.java")
-
-          p.write_text(s2, encoding="utf-8")
-          print("Patched ChatMessageCell OK")
-          PY
-
-      - name: Build universal APK (afatRelease)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          ./gradlew --no-daemon :TMessagesProj_App:assembleAfatRelease
-
-      - name: Upload universal APK
+      - name: Upload APKs
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: TelegramBlur-universal
-          path: "**/afat/release/*.apk"
+          name: Telegram-APKs
+          path: |
+            **/build/outputs/apk/**/*.apk
+            **/build/outputs/**/*.apk
           if-no-files-found: error
 
-      - name: Build arm64 APK (afatRelease)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          ./gradlew --no-daemon :TMessagesProj_App:assembleAfatRelease -PabiFilters=arm64-v8a
-
-      - name: Upload arm64 APK
+      - name: Upload build log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: TelegramBlur-arm64-v8a
-          path: "**/afat/release/*.apk"
-          if-no-files-found: error
-          
+          name: build-logs
+          path: |
+            build.log
+            **/*.log
+          if-no-files-found: warn
